@@ -45,6 +45,14 @@ from jasna.vr180 import (
     resolve_vr_mode,
 )
 from jasna.vr_projection import build_vr_projector
+from jasna.resume_checkpoint import (
+    ResumeCheckpoint,
+    checkpoint_path_for,
+    clear_checkpoint,
+    compute_job_fingerprint,
+    load_checkpoint,
+    save_checkpoint,
+)
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +111,7 @@ class Pipeline:
         segments: tuple[SegmentRange, ...] | None = None,
         splice_plan: SplicePlan | None = None,
         working_dir: Path | None = None,
+        enable_resume: bool = False,
     ) -> None:
         self.input_video = input_video
         self.output_video = output_video
@@ -142,6 +151,8 @@ class Pipeline:
         self._job_detection_model = self.detection_model
         self._cancel_event = threading.Event()
         self.completed = False
+        self.enable_resume = bool(enable_resume)
+        self._resume_checkpoint: ResumeCheckpoint | None = None
 
     @property
     def cancel_requested(self) -> bool:
@@ -281,7 +292,6 @@ class Pipeline:
         while not push_done.is_set():
             if pusher_error:
                 raise pusher_error[0]
-
             if _forward_completed() > 0:
                 if starvation_start is not None:
                     starvation_seconds += time.monotonic() - starvation_start
@@ -303,7 +313,7 @@ class Pipeline:
                 if restorer.flush_pending(target_seqs=target_seqs):
                     flushed_since_last_push = True
                     last_flush_time = now
-                starvation_count += 1
+                    starvation_count += 1
             elif (
                 flushed_since_last_push
                 and restorer.has_pending
@@ -486,6 +496,7 @@ class Pipeline:
                 name="BlendEncode", daemon=True,
             ),
         ]
+
         vram_offloader.start()
         for t in threads:
             t.start()
@@ -564,7 +575,7 @@ class Pipeline:
             )
         elif self.retarget_high_fps:
             log.info(
-                "Frame-rate retargeting requested, but %s fps is not a supported source rate; keeping source rate",
+                "Retargeting frame rate requested, but %s fps is not a supported source rate; keeping source rate",
                 frame_rate.source_fps,
             )
         output_frame_count = frame_rate.output_frame_count(metadata.num_frames)
@@ -599,6 +610,169 @@ class Pipeline:
             )
         finally:
             progress.close(ensure_completed_bar=True)
+
+    def _run_full_resumable(self, metadata) -> None:
+        """Resumable variant of :meth:`_run_full`.
+
+        Instead of rendering directly into ``self.output_video`` in one
+        pass, each run renders a new *fragment* covering the not-yet-done
+        portion of the video into a temporary file, and appends it to a
+        JSON checkpoint's fragment list. Once every frame has been rendered
+        (i.e. this pass reaches the end of the video without being
+        cancelled), all fragments recorded in the checkpoint are
+        concatenated and muxed into ``self.output_video`` using the same
+        fragment-concatenation path already used by smart-render segment
+        processing (:func:`concatenate_fragments`, :func:`mux_final_output`).
+
+        If the process crashes or is killed, ``self.output_video`` is never
+        touched, so there is no half-written output file. The next run with
+        the same output path finds the checkpoint, resumes decoding from
+        the last completed timestamp via ``seek_ts``, and renders only the
+        remaining frames into one more fragment.
+        """
+        frame_rate = resolve_frame_rate_retarget(
+            metadata.video_fps_exact,
+            enabled=self.retarget_high_fps,
+            measured_fps=metadata.average_fps,
+        )
+        output_frame_count = frame_rate.output_frame_count(metadata.num_frames)
+
+        job_fingerprint = compute_job_fingerprint(
+            codec=self.codec,
+            encoder_settings=self.encoder_settings,
+            fp16=bool(getattr(self.restoration_pipeline, "fp16", False)),
+            detection_model_name=type(self.detection_model).__name__,
+            vr_mode=self.vr_mode,
+            vr_projection=self.vr_projection,
+            retarget_high_fps=self.retarget_high_fps,
+        )
+
+        self.output_video.parent.mkdir(parents=True, exist_ok=True)
+        work_root = self.working_dir or self.output_video.parent
+        work_root.mkdir(parents=True, exist_ok=True)
+
+        checkpoint = load_checkpoint(self.output_video, job_fingerprint=job_fingerprint)
+        resuming = checkpoint is not None
+        if not resuming:
+            checkpoint = ResumeCheckpoint.new(
+                job_fingerprint=job_fingerprint,
+                input_video=str(self.input_video),
+                output_video=str(self.output_video),
+                total_frames=output_frame_count,
+            )
+
+        start_frame = checkpoint.last_completed_frame if resuming else 0
+        seek_ts = checkpoint.last_completed_time if resuming else None
+        if resuming:
+            log.info(
+                "[resume] found checkpoint for %s -- resuming from frame %d (t=%.2fs), %d fragment(s) already rendered",
+                self.output_video.name, start_frame, seek_ts, len(checkpoint.fragments),
+            )
+
+        remaining_frames = max(1, output_frame_count - start_frame)
+        fragment_index = len(checkpoint.fragments)
+        fragment_suffix = self.output_video.suffix if self.codec not in {"h264", "hevc"} else ".ts"
+        fragment_path = work_root / f".{self.output_video.stem}.resume-{fragment_index:04d}{fragment_suffix}"
+
+        progress = Progressbar(
+            total_frames=remaining_frames,
+            video_fps=float(frame_rate.output_fps),
+            disable=self.disable_progress,
+            callback=self.progress_callback,
+        )
+
+        checkpoint_state = {"last_save": 0.0}
+        user_callback = self.progress_callback
+
+        def _checkpoint_progress(frames_written: int, *args, **kwargs) -> None:
+            now = time.monotonic()
+            if now - checkpoint_state["last_save"] >= 0.5:
+                checkpoint.last_completed_frame = start_frame + frames_written
+                checkpoint.last_completed_time = (
+                    (seek_ts or 0.0) + frames_written / float(frame_rate.output_fps)
+                )
+                try:
+                    save_checkpoint(checkpoint)
+                except OSError:
+                    log.warning("[resume] failed to write checkpoint", exc_info=True)
+                checkpoint_state["last_save"] = now
+            if user_callback is not None:
+                user_callback(frames_written, *args, **kwargs)
+
+        progress.callback = _checkpoint_progress
+
+        encoder_ctx = NvidiaVideoEncoder(
+            str(fragment_path),
+            device=self.device,
+            metadata=metadata,
+            codec=self.codec,
+            encoder_settings=self.encoder_settings,
+            lut_path=self.lut_path,
+            sharpen_strength=self.sharpen_strength,
+            output_fps=frame_rate.output_fps,
+            fmp4=False,
+            mux_audio=False,
+        )
+        try:
+            self._run_pass(
+                metadata=metadata,
+                encoder_ctx=encoder_ctx,
+                progress=progress,
+                seek_ts=seek_ts,
+                output_frame_count=remaining_frames,
+            )
+        finally:
+            progress.close(ensure_completed_bar=True)
+
+        frames_rendered_this_pass = checkpoint.last_completed_frame - start_frame
+        pass_completed_video = not self._cancel_event.is_set() and frames_rendered_this_pass >= remaining_frames
+
+        if not pass_completed_video:
+            if frames_rendered_this_pass > 0:
+                fragment_duration = frames_rendered_this_pass / float(frame_rate.output_fps)
+                checkpoint.add_fragment(fragment_path, fragment_duration)
+                save_checkpoint(checkpoint)
+            else:
+                fragment_path.unlink(missing_ok=True)
+            return
+
+        fragment_duration = frames_rendered_this_pass / float(frame_rate.output_fps)
+        checkpoint.add_fragment(fragment_path, fragment_duration)
+        save_checkpoint(checkpoint)
+
+        fragments = checkpoint.fragment_paths()
+        if len(fragments) == 1:
+            normalized = fragments[0][0]
+        else:
+            work_suffix = fragment_suffix
+            normalized_fragments: list[tuple[Path, float]] = []
+            for i, (frag_path, frag_duration) in enumerate(fragments):
+                normalized_path = frag_path.with_name(f".{self.output_video.stem}.resume-norm-{i:04d}{work_suffix}")
+                normalize_fragment(frag_path, normalized_path, codec=self.codec)
+                normalized_fragments.append((normalized_path, frag_duration))
+            assembled = work_root / f".{self.output_video.stem}.resume-assembled{fragment_suffix}"
+            concatenate_fragments(
+                normalized_fragments,
+                manifest=work_root / f".{self.output_video.stem}.resume-fragments.ffconcat",
+                destination=assembled,
+                codec=self.codec,
+            )
+            for normalized_path, _ in normalized_fragments:
+                normalized_path.unlink(missing_ok=True)
+            normalized = assembled
+
+        mux_final_output(
+            normalized,
+            self.input_video,
+            self.output_video,
+            codec=self.codec,
+        )
+
+        for frag_path, _ in fragments:
+            frag_path.unlink(missing_ok=True)
+        if normalized != fragments[0][0]:
+            normalized.unlink(missing_ok=True)
+        clear_checkpoint(self.output_video)
 
     def _run_smart(self, metadata) -> None:
         codec = validate_smart_render(
@@ -712,6 +886,8 @@ class Pipeline:
                 )
                 self.fmp4 = False
             self._run_smart(metadata)
+        elif self.enable_resume and not self._vr_resolution.is_sbs:
+            self._run_full_resumable(metadata)
         else:
             self._run_full(metadata)
         self.completed = not self._cancel_event.is_set()
